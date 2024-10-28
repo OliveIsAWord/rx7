@@ -18,7 +18,7 @@ fn main() {
     use ariadne::{Label, Report, ReportKind, Source};
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("usage: {} <file>", args.get(0).map(String::as_ref).unwrap_or("rx7"));
+        eprintln!("usage: {} <file>", args.first().map_or("rx7", String::as_ref));
         exit(1);
     };
     let file_path = args[1].as_ref();
