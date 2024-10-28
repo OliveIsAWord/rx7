@@ -50,7 +50,7 @@ fn main() {
     };
     match execute(&block) {
         Ok(()) => {}
-        Err(RuntimeError { kind, span }) => exit_with_error(Diagnostic {
+        Err(RuntimeError { kind, span, .. }) => exit_with_error(Diagnostic {
             span,
             message: "instruction raised".to_owned(),
             label: format!("{kind}"),
@@ -83,6 +83,12 @@ enum Op {
     Pop,
     Flip,
     Yank,
+    Raise,
+    Except(Block, Block),
+    Suppress(Block),
+    Invert(Block),
+    Mask(Block),
+    Trace,
 }
 
 const OP_CHARS: &[(char, Op)] = &[
@@ -108,9 +114,20 @@ const OP_CHARS: &[(char, Op)] = &[
     ('p', Op::Pop),
     ('f', Op::Flip),
     ('^', Op::Yank),
+    ('r', Op::Raise),
+    ('v', Op::Trace),
 ];
 
-type Block = (Vec<Op>, Vec<Span>);
+const ONE_BLOCK_CHARS: &[(char, fn(Block) -> Op)] =
+    &[('s', Op::Suppress), ('!', Op::Invert), ('m', Op::Mask)];
+
+const TWO_BLOCK_CHARS: &[(char, fn(Block, Block) -> Op)] = &[('e', Op::Except)];
+
+#[derive(Clone, Debug)]
+struct Block {
+    ops: Vec<Op>,
+    spans: Vec<Span>,
+}
 
 struct ParseError {
     kind: ParseErrorKind,
@@ -119,12 +136,14 @@ struct ParseError {
 
 enum ParseErrorKind {
     UnknownToken(char),
+    UnexpectedBacktick,
 }
 
 impl ParseErrorKind {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::UnknownToken(_) => "unknown token",
+            Self::UnexpectedBacktick => "unexpected backtick",
         }
     }
 }
@@ -134,6 +153,7 @@ impl std::fmt::Display for ParseErrorKind {
         f.write_str(self.label())?;
         match self {
             Self::UnknownToken(c) => write!(f, " {c:?}"),
+            Self::UnexpectedBacktick => Ok(()),
         }
     }
 }
@@ -160,10 +180,23 @@ impl Parser<'_> {
         self.i += self.get_char().unwrap().len_utf8();
     }
 
+    fn consume_if(&mut self, c: char) -> bool {
+        let is_char = self.get_char() == Some(c);
+        if is_char {
+            self.next_char();
+        }
+        is_char
+    }
+
     fn parse_op(&mut self) -> ParseResult<Option<Op>> {
         let ops: HashMap<char, &Op> = OP_CHARS.iter().map(|(c, op)| (*c, op)).collect();
+        let one_block_ops: HashMap<char, fn(Block) -> Op> =
+            ONE_BLOCK_CHARS.iter().map(|&(c, op)| (c, op)).collect();
+        let two_block_ops: HashMap<char, fn(Block, Block) -> Op> =
+            TWO_BLOCK_CHARS.iter().map(|&(c, op)| (c, op)).collect();
         let Some(c) = self.get_char() else { return Ok(None) };
         let op = match c {
+            '`' => return Ok(None),
             c if c.is_ascii_digit() => {
                 if c == '0' {
                     self.next_char();
@@ -181,19 +214,27 @@ impl Parser<'_> {
                     Op::Int(num_str.parse().unwrap())
                 }
             }
-            c => match ops.get(&c) {
-                Some(&op) => {
+            c => {
+                if let Some(&op) = ops.get(&c) {
                     self.next_char();
                     let w: Op = op.clone();
                     w
-                }
-                None => {
+                } else if let Some(&op) = one_block_ops.get(&c) {
+                    self.next_char();
+                    let block = self.parse_last_block()?;
+                    op(block)
+                } else if let Some(&op) = two_block_ops.get(&c) {
+                    self.next_char();
+                    let block1 = self.parse_last_block()?;
+                    let block2 = self.parse_last_block()?;
+                    op(block1, block2)
+                } else {
                     return Err(ParseError {
                         kind: ParseErrorKind::UnknownToken(c),
                         span: self.i..self.i + c.len_utf8(),
                     });
                 }
-            },
+            }
         };
         Ok(Some(op))
     }
@@ -205,7 +246,28 @@ impl Parser<'_> {
             self.trim();
             let old_i = self.i;
             let Some(op) = self.parse_op()? else {
-                return Ok((ops, spans));
+                if self.consume_if('`') {
+                    return Err(ParseError {
+                        kind: ParseErrorKind::UnexpectedBacktick,
+                        span: self.i - 1..self.i,
+                    });
+                }
+                return Ok(Block { ops, spans });
+            };
+            ops.push(op);
+            spans.push(old_i..self.i);
+        }
+    }
+
+    fn parse_last_block(&mut self) -> ParseResult<Block> {
+        let mut ops = vec![];
+        let mut spans = vec![];
+        loop {
+            self.trim();
+            let old_i = self.i;
+            let Some(op) = self.parse_op()? else {
+                self.consume_if('`');
+                return Ok(Block { ops, spans });
             };
             ops.push(op);
             spans.push(old_i..self.i);
@@ -222,6 +284,23 @@ fn parse(src: &str) -> ParseResult<Block> {
 struct RuntimeError {
     kind: RuntimeErrorKind,
     span: Span,
+    masks: usize,
+}
+
+impl RuntimeError {
+    pub const fn mask(mut self) -> Self {
+        self.masks += 1;
+        self
+    }
+
+    pub const fn unmask(mut self) -> Result<(), Self> {
+        if self.masks == 0 {
+            Ok(())
+        } else {
+            self.masks -= 1;
+            Err(self)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +310,8 @@ enum RuntimeErrorKind {
     DivisionByZero,
     NonInteger,
     Assertion,
+    ExplicitRaise,
+    DidNotRaise,
 }
 
 use RuntimeErrorKind::*;
@@ -243,13 +324,13 @@ impl std::fmt::Display for RuntimeErrorKind {
             Self::DivisionByZero => write!(f, "division by zero"),
             Self::NonInteger => write!(f, "not an integer"),
             Self::Assertion => write!(f, "assertion failure"),
+            Self::ExplicitRaise => write!(f, "explicit raise"),
+            Self::DidNotRaise => write!(f, "block didn't raise"),
         }
     }
 }
 
 type RuntimeResult<T> = Result<T, RuntimeError>;
-
-type RawResult<T> = Result<T, RuntimeErrorKind>;
 
 #[derive(Clone, Debug)]
 struct State<'a> {
@@ -275,6 +356,10 @@ impl State<'_> {
         println!();
     }
 
+    fn error(&self, kind: RuntimeErrorKind) -> RuntimeError {
+        RuntimeError { kind, span: self.spans[self.ip].clone(), masks: 0 }
+    }
+
     fn push_group(&mut self, group: Vec<Value>) {
         self.stack.push(group);
     }
@@ -283,12 +368,14 @@ impl State<'_> {
         self.push_group(vec![value]);
     }
 
-    fn pop_group(&mut self) -> RawResult<Vec<Value>> {
-        self.stack.pop().ok_or(StackUnderflow)
+    fn pop_group(&mut self) -> RuntimeResult<Vec<Value>> {
+        self.stack.pop().ok_or_else(|| self.error(StackUnderflow))
     }
 
-    fn pop_value(&mut self) -> RawResult<Value> {
-        let group = self.stack.last_mut().ok_or(StackUnderflow)?;
+    fn pop_value(&mut self) -> RuntimeResult<Value> {
+        let Some(group) = self.stack.last_mut() else {
+            return Err(self.error(StackUnderflow));
+        };
         let value = group.pop().unwrap();
         if group.is_empty() {
             self.stack.pop().unwrap();
@@ -298,16 +385,13 @@ impl State<'_> {
 
     fn execute_all(&mut self) -> RuntimeResult<()> {
         while self.ip < self.ops.len() {
-            self.execute_op()
-                .map_err(|kind| RuntimeError { kind, span: self.spans[self.ip].clone() })?;
-            print!("{:?}\n> ", self.ops[self.ip]);
-            self.display_stack();
+            self.execute_op()?;
             self.ip += 1;
         }
         Ok(())
     }
 
-    fn execute_op(&mut self) -> RawResult<()> {
+    fn execute_op(&mut self) -> RuntimeResult<()> {
         macro_rules! op {
             (|$($arg:ident),*| $body:expr) => {{
                #[allow(unused_variables)]{
@@ -328,7 +412,7 @@ impl State<'_> {
                     let $arg = ();
                     match self.pop_value()? {
                         Value::Num(n) => n,
-                        _ => return Err(TypeMismatch),
+                        _ => return Err(self.error(TypeMismatch)),
                     }
                 } ),*]};
                 inputs.reverse();
@@ -344,13 +428,13 @@ impl State<'_> {
                     let $arg = ();
                     match self.pop_value()? {
                         Value::Num(n) => n,
-                        _ => return Err(TypeMismatch),
+                        _ => return Err(self.error(TypeMismatch)),
                     }
                 } ),*]};
                 inputs.reverse();
                 let [$($arg),*] = inputs;
                 if !$body {
-                    return Err(Assertion);
+                    return Err(self.error(Assertion));
                 }
             }}}
         }
@@ -370,18 +454,22 @@ impl State<'_> {
             Op::Mul => math_op!(|a, b| a * b),
             Op::Quotient => math_op!(|a, b| {
                 if !a.is_integer() || !b.is_integer() {
-                    return Err(NonInteger);
+                    return Err(self.error(NonInteger));
                 }
-                a.to_integer().checked_div_euclid(&b.to_integer()).ok_or(DivisionByZero)?
+                a.to_integer()
+                    .checked_div_euclid(&b.to_integer())
+                    .ok_or_else(|| self.error(DivisionByZero))?
             }),
             Op::Remainder => math_op!(|a, b| {
                 if !a.is_integer() || !b.is_integer() {
-                    return Err(NonInteger);
+                    return Err(self.error(NonInteger));
                 }
-                a.to_integer().checked_rem_euclid(&b.to_integer()).ok_or(DivisionByZero)?
+                a.to_integer()
+                    .checked_rem_euclid(&b.to_integer())
+                    .ok_or_else(|| self.error(DivisionByZero))?
             }),
             Op::Div => {
-                math_op!(|a, b| a.checked_div(&b).ok_or(DivisionByZero)?);
+                math_op!(|a, b| a.checked_div(&b).ok_or_else(|| self.error(DivisionByZero))?);
             }
             Op::Neg => math_op!(|a| -a),
             Op::Floor => math_op!(|a| a.floor()),
@@ -395,7 +483,7 @@ impl State<'_> {
             Op::Box => op!(|v| Value::Box(Box::new(v))),
             Op::Unbox => op!(|v| match v {
                 Value::Box(b) => *b,
-                _ => return Err(TypeMismatch),
+                _ => return Err(self.error(TypeMismatch)),
             }),
             Op::Group => {
                 let mut rhs = self.pop_group()?;
@@ -409,8 +497,44 @@ impl State<'_> {
             }
             Op::Flip => swizzle_groups!(a b -- b a),
             Op::Yank => swizzle_groups!(a b -- a b a),
+            Op::Raise => return Err(self.error(ExplicitRaise)),
+            Op::Except(try_block, catch_block) => match self.execute_block(&try_block) {
+                Ok(()) => {}
+                Err(e) => {
+                    e.unmask()?;
+                    self.execute_block_no_rewind(&catch_block)?;
+                }
+            },
+            Op::Suppress(b) => self.execute_block_unmask(&b)?,
+            Op::Invert(b) => match self.execute_block_no_rewind(&b) {
+                Ok(()) => return Err(self.error(DidNotRaise)),
+                Err(e) => e.unmask()?,
+            },
+            Op::Mask(b) => self.execute_block(&b).map_err(RuntimeError::mask)?,
+            Op::Trace => self.display_stack(),
         }
         Ok(())
+    }
+
+    fn execute_block_no_rewind(&mut self, Block { ops, spans }: &Block) -> RuntimeResult<()> {
+        let stack = std::mem::take(&mut self.stack);
+        let mut inner_state = State { stack, ops, spans, ip: 0 };
+        let result = inner_state.execute_all();
+        self.stack = inner_state.stack;
+        result
+    }
+
+    fn execute_block(&mut self, block: &Block) -> RuntimeResult<()> {
+        let old_stack = self.stack.clone();
+        let result = self.execute_block_no_rewind(block);
+        if result.is_err() {
+            self.stack = old_stack;
+        }
+        result
+    }
+
+    fn execute_block_unmask(&mut self, block: &Block) -> RuntimeResult<()> {
+        self.execute_block(block).or_else(RuntimeError::unmask)
     }
 }
 
@@ -429,7 +553,7 @@ impl std::fmt::Display for Value {
     }
 }
 
-fn execute((ops, spans): &Block) -> RuntimeResult<()> {
+fn execute(Block { ops, spans }: &Block) -> RuntimeResult<()> {
     let mut state = State { stack: vec![], ops, spans, ip: 0 };
     state.execute_all()
 }
